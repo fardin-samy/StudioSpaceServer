@@ -11,9 +11,10 @@ MONGODB_URI=your-mongodb-connection-string
 MONGODB_DATABASE=studiospace-client
 IMGBB_API_KEY=your-imgbb-api-key
 PORT=8000
+BETTER_AUTH_URL=http://localhost:3000
 ```
 
-Install dependencies with `npm install`, then start with `npm start`. The local API base URL is `http://localhost:8000` (or the configured `PORT`). `npm test` performs a JavaScript syntax check.
+Install dependencies with `npm install`, then start with `npm start`. The local API base URL is `http://localhost:8000` (or the configured `PORT`). Set `BETTER_AUTH_URL` to the exact base URL configured by the frontend Better Auth server; the backend verifies bearer JWTs using `${BETTER_AUTH_URL}/api/auth/jwks` and validates issuer and audience against that URL. `npm test` performs a JavaScript syntax check.
 
 ## API
 
@@ -22,23 +23,24 @@ All endpoints are available with or without the `/api` prefix (for example, `GET
 | Method | Route | Purpose |
 | --- | --- | --- |
 | GET | `/studios` | List studios; optional `?category=` filter |
-| POST | `/upload-image` | Upload raw image bytes to imgbb |
-| POST | `/studios` | Create a studio |
-| POST | `/add-studio` | Alias for creating a studio |
+| POST | `/upload-image` | Upload raw image bytes to imgbb (JWT required) |
+| POST | `/studios` | Create a studio (JWT required) |
+| POST | `/add-studio` | Alias for creating a studio (JWT required) |
 | GET | `/studios/:id` | Get a studio |
-| GET | `/my-listings?email=` | List studios belonging to an owner |
-| PATCH / PUT | `/studios/:id` | Update a studio owned by `ownerEmail` |
-| DELETE | `/studios/:id?email=` | Delete a studio owned by the supplied email |
-| POST | `/bookings` | Create a booking with `Pending` status |
-| GET | `/my-bookings?email=` | List bookings for a user |
-| PATCH | `/bookings/:id/cancel` | Cancel a user's pending booking |
+| GET | `/studios?mine=1` | List the authenticated user's studios (JWT required) |
+| GET | `/my-listings` | List the authenticated user's studios (JWT required) |
+| PATCH / PUT | `/studios/:id` | Update the authenticated owner's studio (JWT required) |
+| DELETE | `/studios/:id` | Delete the authenticated owner's studio (JWT required) |
+| POST | `/bookings` | Create a booking for the authenticated user (JWT required) |
+| GET | `/bookings` or `/my-bookings` | List the authenticated user's bookings (JWT required) |
+| PATCH | `/bookings/:id/cancel` | Cancel the authenticated user's pending booking (JWT required) |
 
 If the response is an HTML page, check that the client is calling the backend host and port (`http://localhost:8000` locally), not the frontend development server, and that it uses one of the routes above. A JSON `API route not found` response includes the method and path that the backend received.
 
-Studio creation requires `title`, `category`, `hourlyRate`, `maxCapacity`, `location`, `imageUrl`, `overview`, `ownerEmail`, and `ownerName`. `securityDeposit`, `gallery`, and `amenities` are optional. Editing/deleting/listing routes accept the owner email in the query string or JSON body as applicable.
+Send authenticated requests with `Authorization: Bearer <JWT>`. The frontend obtains this short-lived JWT from Better Auth's JWT plugin; do not copy a session cookie/token into source code or send user identity fields as a substitute for verification. The backend derives the user ID, email, and name from the verified JWT. Public studio browsing does not require a token.
 
-Booking creation requires `userEmail` and `userName`, plus either a MongoDB `studioId` or a `studioSlug`. The `studioSlug` can also be supplied as `studioId` for compatibility with clients that use the slug there. Bookings store the resolved MongoDB studio ID. Optional reservation fields are `bookingDate` (or `date`), `startTime`, `durationHours`, and `totalPrice`.
+Studio creation requires `category`, `maxCapacity`, `location`, and an image URL, along with a title (`title` or `name`), hourly rate (`hourlyRate` or `price`), and description (`overview` or `description`). Ownership fields are set from the verified token. Booking creation requires either a MongoDB `studioId` or a `studioSlug`; bookings store the resolved MongoDB studio ID and verified user identity. Optional reservation fields are `bookingDate` (or `date`), `startTime`, `durationHours`, and `totalPrice`.
 
 ## Authentication note
 
-Email parameters are used to scope owner and customer records, but they are not authentication. Before exposing this API publicly, verify the caller's identity with server-validated authentication (for example, Firebase Admin token verification) and derive the email from the verified identity rather than trusting client-supplied email values. Configure CORS to allow only the production frontend origin as appropriate.
+Configure CORS to allow only the production frontend origin as appropriate. Never place the Better Auth signing secret or a user's bearer token in `NEXT_PUBLIC_*` variables, source files, or logs.

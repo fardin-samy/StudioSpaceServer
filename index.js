@@ -2,11 +2,16 @@ import cors from 'cors';
 import 'dotenv/config';
 import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 const app = express();
 const PORT = 8000;
 const DATABASE_NAME = 'studiospace-client';
 const client = new MongoClient(process.env.MONGODB_URI);
+const AUTH_BASE_URL = process.env.BETTER_AUTH_URL?.replace(/\/+$/, '');
+const authJwks = AUTH_BASE_URL
+  ? createRemoteJWKSet(new URL('/api/auth/jwks', `${AUTH_BASE_URL}/`))
+  : null;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(cors());
@@ -43,7 +48,58 @@ const validEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 
 const isValidObjectId = (id) => ObjectId.isValid(id) && String(new ObjectId(id)) === id;
 
+async function requireAuth(req, res, next) {
+  const authorization = req.get('authorization') ?? '';
+  const token = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) return res.status(401).send({ message: 'A valid bearer token is required.' });
+  if (!AUTH_BASE_URL || !authJwks) {
+    return res.status(503).send({ message: 'Backend JWT verification is not configured.' });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, authJwks, {
+      issuer: AUTH_BASE_URL,
+      audience: AUTH_BASE_URL,
+    });
+    const email = normalizeEmail(payload.email);
+    if (typeof payload.sub !== 'string' || !validEmail(email)) {
+      return res.status(401).send({ message: 'The bearer token does not identify a valid user.' });
+    }
+
+    req.authUser = {
+      id: payload.sub,
+      email,
+      name: typeof payload.name === 'string' && payload.name.trim()
+        ? payload.name.trim()
+        : email,
+    };
+    next();
+  } catch {
+    return res.status(401).send({ message: 'The bearer token is invalid or expired.' });
+  }
+}
+
+function requireAuthForMine(req, res, next) {
+  return req.query.mine === '1' ? requireAuth(req, res, next) : next();
+}
+
+function slugify(value) {
+  return String(value)
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 70);
+}
+
 function parseStudio(payload, { partial = false } = {}) {
+  payload = {
+    ...payload,
+    title: payload.title ?? payload.name,
+    hourlyRate: payload.hourlyRate ?? payload.price,
+    overview: payload.overview ?? payload.description,
+  };
   const fields = [
     'title',
     'studioSlug',
@@ -59,6 +115,10 @@ function parseStudio(payload, { partial = false } = {}) {
     'overview',
     'ownerEmail',
     'ownerName',
+    'neighborhood',
+    'size',
+    'instant',
+    'status',
   ];
   const studio = {};
 
@@ -125,12 +185,14 @@ function parseStudio(payload, { partial = false } = {}) {
   if (studio.studioSlug !== undefined && typeof studio.studioSlug !== 'string') {
     return { error: 'studioSlug must be a string.' };
   }
+  if (studio.status !== undefined && !['Live', 'Paused'].includes(studio.status)) {
+    return { error: 'status must be Live or Paused.' };
+  }
+  if (studio.instant !== undefined && typeof studio.instant !== 'boolean') {
+    return { error: 'instant must be a boolean.' };
+  }
 
   return { studio };
-}
-
-function getEmailFromRequest(req) {
-  return normalizeEmail(req.query.email ?? req.query.ownerEmail ?? req.body?.email ?? req.body?.ownerEmail);
 }
 
 app.get('/', (req, res) => {
@@ -139,6 +201,7 @@ app.get('/', (req, res) => {
 
 app.post(
   '/upload-image',
+  requireAuth,
   express.raw({ type: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'], limit: '10mb' }),
   async (req, res) => {
     const apiKey = process.env.IMGBB_API_KEY;
@@ -162,38 +225,47 @@ app.post(
   },
 );
 
-app.get('/studios', async (req, res) => {
+app.get('/studios', requireAuthForMine, async (req, res) => {
   const filter = {};
   if (typeof req.query.category === 'string') filter.category = req.query.category;
+  if (req.query.mine === '1') filter.ownerEmail = req.authUser.email;
 
   const studios = await studiosCollection
     .find(filter)
     .sort({ createdAt: -1 })
     .toArray();
-  res.send(studios);
+  res.send({ studios });
 });
 
 async function createStudio(req, res) {
-  const { studio, error } = parseStudio(req.body ?? {});
+  const { studio, error } = parseStudio({
+    ...(req.body ?? {}),
+    ownerEmail: req.authUser.email,
+    ownerName: req.authUser.name,
+  });
   if (error) return res.status(400).send({ message: error });
 
   const now = new Date();
+  const id = new ObjectId();
   const newStudio = {
     ...studio,
+    _id: id,
+    slug: studio.studioSlug || `${slugify(studio.title) || 'studio'}-${id.toString().slice(-6)}`,
     securityDeposit: studio.securityDeposit ?? 0,
     gallery: studio.gallery ?? [],
     amenities: studio.amenities ?? [],
+    status: studio.status ?? 'Live',
     rating: 0,
     reviewCount: 0,
     createdAt: now,
     updatedAt: now,
   };
-  const result = await studiosCollection.insertOne(newStudio);
-  res.status(201).send({ ...newStudio, _id: result.insertedId });
+  await studiosCollection.insertOne(newStudio);
+  res.status(201).send(newStudio);
 }
 
-app.post('/studios', createStudio);
-app.post('/add-studio', createStudio);
+app.post('/studios', requireAuth, createStudio);
+app.post('/add-studio', requireAuth, createStudio);
 
 app.get('/studios/:id', async (req, res) => {
   if (!isValidObjectId(req.params.id)) return res.status(400).send({ message: 'Invalid studio id.' });
@@ -202,17 +274,13 @@ app.get('/studios/:id', async (req, res) => {
   res.send(studio);
 });
 
-app.get('/my-listings', async (req, res) => {
-  const ownerEmail = getEmailFromRequest(req);
-  if (!validEmail(ownerEmail)) return res.status(400).send({ message: 'A valid owner email is required.' });
-  const studios = await studiosCollection.find({ ownerEmail }).sort({ createdAt: -1 }).toArray();
+app.get('/my-listings', requireAuth, async (req, res) => {
+  const studios = await studiosCollection.find({ ownerEmail: req.authUser.email }).sort({ createdAt: -1 }).toArray();
   res.send(studios);
 });
 
 async function updateStudio(req, res) {
   if (!isValidObjectId(req.params.id)) return res.status(400).send({ message: 'Invalid studio id.' });
-  const ownerEmail = getEmailFromRequest(req);
-  if (!validEmail(ownerEmail)) return res.status(400).send({ message: 'A valid owner email is required.' });
 
   const { studio, error } = parseStudio(req.body ?? {}, { partial: true });
   if (error) return res.status(400).send({ message: error });
@@ -222,29 +290,28 @@ async function updateStudio(req, res) {
   studio.updatedAt = new Date();
 
   const result = await studiosCollection.updateOne(
-    { _id: new ObjectId(req.params.id), ownerEmail },
+    { _id: new ObjectId(req.params.id), ownerEmail: req.authUser.email },
     { $set: studio },
   );
   if (result.matchedCount === 0) return res.status(404).send({ message: 'Studio not found for this owner.' });
   res.send({ message: 'Studio updated successfully.' });
 }
 
-app.patch('/studios/:id', updateStudio);
-app.put('/studios/:id', updateStudio);
+app.patch('/studios/:id', requireAuth, updateStudio);
+app.put('/studios/:id', requireAuth, updateStudio);
 
-app.delete('/studios/:id', async (req, res) => {
+app.delete('/studios/:id', requireAuth, async (req, res) => {
   if (!isValidObjectId(req.params.id)) return res.status(400).send({ message: 'Invalid studio id.' });
-  const ownerEmail = getEmailFromRequest(req);
-  if (!validEmail(ownerEmail)) return res.status(400).send({ message: 'A valid owner email is required.' });
 
-  const result = await studiosCollection.deleteOne({ _id: new ObjectId(req.params.id), ownerEmail });
+  const result = await studiosCollection.deleteOne({ _id: new ObjectId(req.params.id), ownerEmail: req.authUser.email });
   if (result.deletedCount === 0) return res.status(404).send({ message: 'Studio not found for this owner.' });
   res.send({ message: 'Studio deleted successfully.' });
 });
 
-app.post('/bookings', async (req, res) => {
-  const { studioId, studioSlug, userEmail, userName } = req.body ?? {};
-  const email = normalizeEmail(userEmail);
+app.post('/bookings', requireAuth, async (req, res) => {
+  const { studioId, studioSlug } = req.body ?? {};
+  const email = req.authUser.email;
+  const userName = req.authUser.name;
   const normalizedStudioId = typeof studioId === 'string' ? studioId.trim() : '';
   const normalizedStudioSlug = typeof studioSlug === 'string' && studioSlug.trim()
     ? studioSlug.trim()
@@ -283,20 +350,21 @@ app.post('/bookings', async (req, res) => {
   res.status(201).send({ ...booking, _id: result.insertedId });
 });
 
-app.get('/api/bookings', async (req, res) => {
-  const userEmail = getEmailFromRequest(req);
-  if (!validEmail(userEmail)) return res.status(400).send({ message: 'A valid user email is required.' });
-  const bookings = await bookingsCollection.find({ userEmail }).sort({ createdAt: -1 }).toArray();
-  res.send(bookings);
+app.get('/bookings', requireAuth, async (req, res) => {
+  const bookings = await bookingsCollection.find({ userEmail: req.authUser.email }).sort({ createdAt: -1 }).toArray();
+  res.send({ bookings });
 });
 
-app.patch('/api/bookings/:id/cancel', async (req, res) => {
+app.get('/my-bookings', requireAuth, async (req, res) => {
+  const bookings = await bookingsCollection.find({ userEmail: req.authUser.email }).sort({ createdAt: -1 }).toArray();
+  res.send({ bookings });
+});
+
+app.patch('/bookings/:id/cancel', requireAuth, async (req, res) => {
   if (!isValidObjectId(req.params.id)) return res.status(400).send({ message: 'Invalid booking id.' });
-  const userEmail = getEmailFromRequest(req);
-  if (!validEmail(userEmail)) return res.status(400).send({ message: 'A valid user email is required.' });
 
   const result = await bookingsCollection.updateOne(
-    { _id: new ObjectId(req.params.id), userEmail, status: 'Pending' },
+    { _id: new ObjectId(req.params.id), userEmail: req.authUser.email, status: 'Pending' },
     { $set: { status: 'Cancelled', updatedAt: new Date() } },
   );
   if (result.matchedCount === 0) {
