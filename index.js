@@ -8,21 +8,14 @@ const app = express();
 const PORT = 8000;
 const DATABASE_NAME = 'studiospace-client';
 const client = new MongoClient(process.env.MONGODB_URI);
-const AUTH_BASE_URL = process.env.BETTER_AUTH_URL?.replace(/\/+$/, '');
+const AUTH_BASE_URL = process.env.BETTER_AUTH_URL;
 const authJwks = AUTH_BASE_URL
   ? createRemoteJWKSet(new URL('/api/auth/jwks', `${AUTH_BASE_URL}/`))
   : null;
 
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 app.use(cors());
-app.use((req, res, next) => {
-  if (req.url === '/api') {
-    req.url = '/';
-  } else if (req.url.startsWith('/api/')) {
-    req.url = req.url.slice(4);
-  }
-  next();
-});
+
 
 export async function connectToMongoDB() {
   await client.connect();
@@ -35,11 +28,7 @@ const db = mongoClient.db(DATABASE_NAME);
 const studiosCollection = db.collection('studios');
 const bookingsCollection = db.collection('bookings');
 
-await Promise.all([
-  studiosCollection.createIndex({ ownerEmail: 1 }),
-  bookingsCollection.createIndex({ userEmail: 1, createdAt: -1 }),
-  bookingsCollection.createIndex({ studioId: 1 }),
-]);
+
 
 const normalizeEmail = (email) =>
   typeof email === 'string' ? email.trim().toLowerCase() : '';
@@ -373,21 +362,8 @@ app.patch('/bookings/:id/cancel', requireAuth, async (req, res) => {
   res.send({ message: 'Booking cancelled successfully.' });
 });
 
-app.use((req, res) => {
-  res.status(404).json({
-    message: 'API route not found.',
-    method: req.method,
-    path: req.originalUrl,
-  });
-});
 
-app.use((err, req, res, next) => {
-  console.error(err);
-  const statusCode = err instanceof SyntaxError && 'body' in err ? 400 : 500;
-  res.status(statusCode).json({
-    message: statusCode === 400 ? 'Invalid JSON request body.' : 'An unexpected server error occurred.',
-  });
-});
+
 
 app.listen(PORT, () => {
   console.log(`Server is running at http://localhost:${PORT}`);
